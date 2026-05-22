@@ -1,5 +1,5 @@
 /*
-See the LICENSE.txt file for this sample’s licensing information.
+See the LICENSE.txt file for this sample's licensing information.
 
 Abstract:
 An object that manages a capture session and its inputs and outputs.
@@ -17,6 +17,8 @@ actor CaptureService {
     @Published private(set) var captureActivity: CaptureActivity = .idle
     /// A value that indicates the current capture capabilities of the service.
     @Published private(set) var captureCapabilities = CaptureCapabilities.unknown
+    /// A value that indicates whether the photo output is ready for a new capture.
+    @Published private(set) var captureReadiness: AVCapturePhotoOutput.CaptureReadiness = .sessionNotRunning
     /// A Boolean value that indicates whether a higher priority event, like receiving a phone call, interrupts the app.
     @Published private(set) var isInterrupted = false
     /// A Boolean value that indicates whether the user enables HDR video capture.
@@ -474,7 +476,67 @@ actor CaptureService {
     func capturePhoto(with features: PhotoFeatures) async throws -> Photo {
         try await photoCapture.capturePhoto(with: features)
     }
-    
+
+    func prepareForCapture(with features: PhotoFeatures) {
+        photoCapture.prepareForCapture(with: features)
+    }
+
+    /// Switches to a camera or format that supports the requested dimensions if the current configuration doesn't.
+    func switchToDeviceSupportingDimensions(_ dimensions: CMVideoDimensions) {
+        let currentDimensions = currentDevice.activeFormat.supportedMaxPhotoDimensions
+        if currentDimensions.contains(dimensions) { return }
+
+        // Check if a different format on the current device supports the dimensions.
+        if let format = currentDevice.formats.first(where: {
+            $0.isHighestPhotoQualitySupported && $0.supportedMaxPhotoDimensions.contains(dimensions)
+        }) {
+            captureSession.beginConfiguration()
+            defer { captureSession.commitConfiguration() }
+            do {
+                try currentDevice.lockForConfiguration()
+                currentDevice.activeFormat = format
+                currentDevice.unlockForConfiguration()
+                updateCaptureCapabilities()
+            } catch {
+                logger.error("Unable to switch format: \(error)")
+            }
+            return
+        }
+
+        // Check if another camera supports the dimensions.
+        for camera in deviceLookup.allCameras(for: currentDevice.position) where camera != currentDevice {
+            let supportsInAnyPhotoFormat = camera.formats.contains { format in
+                format.isHighestPhotoQualitySupported && format.supportedMaxPhotoDimensions.contains(dimensions)
+            }
+            if supportsInAnyPhotoFormat {
+                changeCaptureDevice(to: camera)
+                return
+            }
+        }
+    }
+
+    func setDeferredProcessingEnabled(_ enabled: Bool) {
+        photoCapture.isDeferredProcessingEnabled = enabled
+        reconfigurePhotoOutputFeatures()
+    }
+
+    func setFastCapturePrioritizationEnabled(_ enabled: Bool) {
+        photoCapture.isFastCapturePrioritizationEnabled = enabled
+        reconfigurePhotoOutputFeatures()
+    }
+
+    func setResponsiveCaptureEnabled(_ enabled: Bool) {
+        photoCapture.isResponsiveCaptureEnabled = enabled
+        reconfigurePhotoOutputFeatures()
+    }
+
+    private func reconfigurePhotoOutputFeatures() {
+        let output = photoCapture.output
+        output.isResponsiveCaptureEnabled = photoCapture.isResponsiveCaptureEnabled && output.isResponsiveCaptureSupported
+        output.isFastCapturePrioritizationEnabled = photoCapture.isFastCapturePrioritizationEnabled && output.isFastCapturePrioritizationSupported
+        output.isAutoDeferredPhotoDeliveryEnabled = photoCapture.isDeferredProcessingEnabled && output.isAutoDeferredPhotoDeliverySupported
+    }
+
     // MARK: - Movie capture
     /// Starts recording video. The video records until the user stops recording,
     /// which calls the following `stopRecording()` method.
@@ -520,7 +582,22 @@ actor CaptureService {
         // Set the capture service's capabilities for the selected mode.
         switch captureMode {
         case .photo:
-            captureCapabilities = photoCapture.capabilities
+            var capabilities = photoCapture.capabilities
+            // Collect dimensions from all cameras and photo formats for the current position.
+            var allDimensions = Set<CMVideoDimensions>()
+            for camera in deviceLookup.allCameras(for: currentDevice.position) {
+                for format in camera.formats where format.isHighestPhotoQualitySupported {
+                    allDimensions.formUnion(format.supportedMaxPhotoDimensions)
+                }
+            }
+            let sorted = allDimensions.sorted(by: <)
+            var seenLabels = Set<String>()
+            let merged = sorted.filter { seenLabels.insert($0.displayString).inserted }
+            capabilities = CaptureCapabilities(
+                isLivePhotoCaptureSupported: capabilities.isLivePhotoCaptureSupported,
+                supportedPhotoDimensions: merged
+            )
+            captureCapabilities = capabilities
         case .video:
             captureCapabilities = movieCapture.capabilities
         }
@@ -531,6 +608,8 @@ actor CaptureService {
     private func observeOutputServices() {
         Publishers.Merge(photoCapture.$captureActivity, movieCapture.$captureActivity)
             .assign(to: &$captureActivity)
+        photoCapture.$captureReadiness
+            .assign(to: &$captureReadiness)
     }
     
     /// Observe when capture control enter and exit a fullscreen appearance.

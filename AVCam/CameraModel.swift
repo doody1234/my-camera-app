@@ -1,5 +1,5 @@
 /*
-See the LICENSE.txt file for this sample’s licensing information.
+See the LICENSE.txt file for this sample's licensing information.
 
 Abstract:
 An object that provides the interface to the features of the camera.
@@ -7,6 +7,7 @@ An object that provides the interface to the features of the camera.
 
 import SwiftUI
 import Combine
+import AVFoundation
 
 /// An object that provides the interface to the features of the camera.
 ///
@@ -37,6 +38,9 @@ final class CameraModel: Camera {
     
     /// A Boolean value that indicates whether to show visual feedback when capture begins.
     private(set) var shouldFlashScreen = false
+
+    /// A Boolean value that indicates whether the camera is ready to capture a new photo.
+    private(set) var isReadyToCapture = true
     
     /// A thumbnail for the last captured photo or video.
     private(set) var thumbnail: CGImage?
@@ -49,6 +53,12 @@ final class CameraModel: Camera {
     
     /// A Boolean that indicates whether the camera supports HDR video recording.
     private(set) var isHDRVideoSupported = false
+
+    /// The available photo dimensions for the current device.
+    private(set) var supportedPhotoDimensions: [CMVideoDimensions] = []
+
+    /// The user-selected max photo dimensions.
+    var maxPhotoDimensions: CMVideoDimensions = .zero
     
     /// An object that saves captured media to a person's Photos library.
     private let mediaLibrary = MediaLibrary()
@@ -120,12 +130,30 @@ final class CameraModel: Camera {
     }
     
     // MARK: - Photo capture
-    
+
+    /// Selects the maximum photo dimensions, switching to the wide-angle camera if needed.
+    func selectMaxPhotoDimensions(_ dimensions: CMVideoDimensions) async {
+        await captureService.switchToDeviceSupportingDimensions(dimensions)
+        maxPhotoDimensions = dimensions
+        await preparePhotoCapture()
+    }
+
+    private var currentPhotoFeatures: PhotoFeatures {
+        PhotoFeatures(
+            isLivePhotoEnabled: isLivePhotoEnabled,
+            qualityPrioritization: qualityPrioritization,
+            maxPhotoDimensions: maxPhotoDimensions
+        )
+    }
+
+    private func preparePhotoCapture() async {
+        await captureService.prepareForCapture(with: currentPhotoFeatures)
+    }
+
     /// Captures a photo and writes it to the user's Photos library.
     func capturePhoto() async {
         do {
-            let photoFeatures = PhotoFeatures(isLivePhotoEnabled: isLivePhotoEnabled, qualityPrioritization: qualityPrioritization)
-            let photo = try await captureService.capturePhoto(with: photoFeatures)
+            let photo = try await captureService.capturePhoto(with: currentPhotoFeatures)
             try await mediaLibrary.save(photo: photo)
         } catch {
             self.error = error
@@ -147,7 +175,31 @@ final class CameraModel: Camera {
             cameraState.qualityPrioritization = qualityPrioritization
         }
     }
-    
+
+    /// A Boolean value that indicates whether deferred photo processing is enabled.
+    var isDeferredProcessingEnabled = true {
+        didSet {
+            guard status == .running else { return }
+            Task { await captureService.setDeferredProcessingEnabled(isDeferredProcessingEnabled) }
+        }
+    }
+
+    /// A Boolean value that indicates whether fast capture prioritization is enabled.
+    var isFastCapturePrioritizationEnabled = true {
+        didSet {
+            guard status == .running else { return }
+            Task { await captureService.setFastCapturePrioritizationEnabled(isFastCapturePrioritizationEnabled) }
+        }
+    }
+
+    /// A Boolean value that indicates whether responsive shutter is enabled.
+    var isResponsiveCaptureEnabled = true {
+        didSet {
+            guard status == .running else { return }
+            Task { await captureService.setResponsiveCaptureEnabled(isResponsiveCaptureEnabled) }
+        }
+    }
+
     /// Performs a focus and expose operation at the specified screen point.
     func focusAndExpose(at point: CGPoint) async {
         await captureService.focusAndExpose(at: point)
@@ -220,6 +272,11 @@ final class CameraModel: Camera {
             for await capabilities in await captureService.$captureCapabilities.values {
                 isHDRVideoSupported = capabilities.isHDRSupported
                 cameraState.isVideoHDRSupported = capabilities.isHDRSupported
+                // Update available photo dimensions and validate the current selection.
+                supportedPhotoDimensions = capabilities.supportedPhotoDimensions
+                if !capabilities.supportedPhotoDimensions.contains(maxPhotoDimensions) {
+                    maxPhotoDimensions = capabilities.supportedPhotoDimensions.first ?? .zero
+                }
             }
         }
         
@@ -230,6 +287,12 @@ final class CameraModel: Camera {
                     // Prefer showing a minimized UI when capture controls enter a fullscreen appearance.
                     prefersMinimizedUI = isShowingFullscreenControls
                 }
+            }
+        }
+
+        Task {
+            for await readiness in await captureService.$captureReadiness.values {
+                isReadyToCapture = readiness == .ready
             }
         }
     }

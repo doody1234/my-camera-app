@@ -1,5 +1,5 @@
 /*
-See the LICENSE.txt file for this sample’s licensing information.
+See the LICENSE.txt file for this sample's licensing information.
 
 Abstract:
 An object that manages a photo capture output to take photographs.
@@ -14,42 +14,62 @@ enum PhotoCaptureError: Error {
 
 /// An object that manages a photo capture output to perform take photographs.
 final class PhotoCapture: OutputService {
-    
+
     /// A value that indicates the current state of photo capture.
     @Published private(set) var captureActivity: CaptureActivity = .idle
-    
+
+    /// A value that indicates whether the photo output is ready for a new capture.
+    @Published private(set) var captureReadiness: AVCapturePhotoOutput.CaptureReadiness = .sessionNotRunning
+
     /// The capture output type for this service.
     let output = AVCapturePhotoOutput()
-    
+
     // An internal alias for the output.
     private var photoOutput: AVCapturePhotoOutput { output }
-    
+
+    // The readiness coordinator for the photo output.
+    private var readinessCoordinator: AVCapturePhotoOutputReadinessCoordinator?
+    private var readinessDelegate: ReadinessDelegate?
+
     // The current capabilities available.
     private(set) var capabilities: CaptureCapabilities = .unknown
-    
+
     // A count of Live Photo captures currently in progress.
     private var livePhotoCount = 0
-    
+
     // MARK: - Capture a photo.
-    
+
     /// The app calls this method when the user taps the photo capture button.
     func capturePhoto(with features: PhotoFeatures) async throws -> Photo {
         // Wrap the delegate-based capture API in a continuation to use it in an async context.
         try await withCheckedThrowingContinuation { continuation in
-            
+
             // Create a settings object to configure the photo capture.
             let photoSettings = createPhotoSettings(with: features)
-            
+
+            // Track the request in the readiness coordinator before capturing.
+            readinessCoordinator?.startTrackingCaptureRequest(using: photoSettings)
+
             let delegate = PhotoCaptureDelegate(continuation: continuation)
             monitorProgress(of: delegate)
-            
+
             // Capture a new photo with the specified settings.
             photoOutput.capturePhoto(with: photoSettings, delegate: delegate)
         }
     }
     
     // MARK: - Create a photo settings object.
-    
+
+    /// Prepares the photo output for capture with the specified features.
+    func prepareForCapture(with features: PhotoFeatures) {
+        let photoSettings = createPhotoSettings(with: features)
+        photoOutput.setPreparedPhotoSettingsArray([photoSettings]) { prepared, error in
+            if let error {
+                logger.debug("Failed to prepare photo settings: \(error)")
+            }
+        }
+    }
+
     // Create a photo settings object with the features a person enables in the UI.
     private func createPhotoSettings(with features: PhotoFeatures) -> AVCapturePhotoSettings {
         // Create a new settings object to configure the photo capture.
@@ -66,10 +86,12 @@ final class PhotoCapture: OutputService {
             photoSettings.previewPhotoFormat = [kCVPixelBufferPixelFormatTypeKey as String: previewPhotoPixelFormatType]
         }
         
-        /// Set the largest dimensions that the photo output supports.
-        /// `CaptureService` automatically updates the photo output's `maxPhotoDimensions`
-        /// when the capture pipeline changes.
-        photoSettings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+        // Use the requested dimensions if supported by the current active format, otherwise fall back to the output's max.
+        if currentSupportedDimensions.contains(features.maxPhotoDimensions) {
+            photoSettings.maxPhotoDimensions = features.maxPhotoDimensions
+        } else {
+            photoSettings.maxPhotoDimensions = photoOutput.maxPhotoDimensions
+        }
         
         // Set the movie URL if the photo output supports Live Photo capture.
         photoSettings.livePhotoMovieFileURL = features.isLivePhotoEnabled ? URL.movieFileURL : nil
@@ -110,25 +132,63 @@ final class PhotoCapture: OutputService {
         }
     }
     
+    // The current device's supported dimensions for validation at capture time.
+    private var currentSupportedDimensions: [CMVideoDimensions] = []
+
+    var isDeferredProcessingEnabled = true
+    var isFastCapturePrioritizationEnabled = true
+    var isResponsiveCaptureEnabled = true
+
     // MARK: - Update the photo output configuration
-    
+
     /// Reconfigures the photo output and updates the output service's capabilities accordingly.
     ///
     /// The `CaptureService` calls this method whenever you change cameras.
     ///
     func updateConfiguration(for device: AVCaptureDevice) {
         // Enable all supported features.
-        photoOutput.maxPhotoDimensions = device.activeFormat.supportedMaxPhotoDimensions.last ?? .zero
+        let supportedDimensions = device.activeFormat.supportedMaxPhotoDimensions
+        currentSupportedDimensions = supportedDimensions
+        photoOutput.maxPhotoDimensions = supportedDimensions.last ?? .zero
         photoOutput.isLivePhotoCaptureEnabled = photoOutput.isLivePhotoCaptureSupported
         photoOutput.maxPhotoQualityPrioritization = .quality
-        photoOutput.isResponsiveCaptureEnabled = photoOutput.isResponsiveCaptureSupported
-        photoOutput.isFastCapturePrioritizationEnabled = photoOutput.isFastCapturePrioritizationSupported
-        photoOutput.isAutoDeferredPhotoDeliveryEnabled = photoOutput.isAutoDeferredPhotoDeliverySupported
+        photoOutput.isResponsiveCaptureEnabled = isResponsiveCaptureEnabled && photoOutput.isResponsiveCaptureSupported
+        photoOutput.isFastCapturePrioritizationEnabled = isFastCapturePrioritizationEnabled && photoOutput.isFastCapturePrioritizationSupported
+        photoOutput.isAutoDeferredPhotoDeliveryEnabled = isDeferredProcessingEnabled && photoOutput.isAutoDeferredPhotoDeliverySupported
+        configureReadinessCoordinator()
         updateCapabilities(for: device)
     }
     
     private func updateCapabilities(for device: AVCaptureDevice) {
-        capabilities = CaptureCapabilities(isLivePhotoCaptureSupported: photoOutput.isLivePhotoCaptureSupported)
+        capabilities = CaptureCapabilities(
+            isLivePhotoCaptureSupported: photoOutput.isLivePhotoCaptureSupported,
+            supportedPhotoDimensions: device.activeFormat.supportedMaxPhotoDimensions
+        )
+    }
+
+    private func configureReadinessCoordinator() {
+        let delegate = ReadinessDelegate { [weak self] readiness in
+            self?.captureReadiness = readiness
+        }
+        let coordinator = AVCapturePhotoOutputReadinessCoordinator(photoOutput: photoOutput)
+        coordinator.delegate = delegate
+        self.readinessDelegate = delegate
+        self.readinessCoordinator = coordinator
+    }
+}
+
+private class ReadinessDelegate: NSObject, AVCapturePhotoOutputReadinessCoordinatorDelegate {
+    private let onChange: (AVCapturePhotoOutput.CaptureReadiness) -> Void
+
+    init(onChange: @escaping (AVCapturePhotoOutput.CaptureReadiness) -> Void) {
+        self.onChange = onChange
+    }
+
+    func readinessCoordinator(
+        _ coordinator: AVCapturePhotoOutputReadinessCoordinator,
+        captureReadinessDidChange captureReadiness: AVCapturePhotoOutput.CaptureReadiness
+    ) {
+        onChange(captureReadiness)
     }
 }
 
@@ -184,7 +244,7 @@ private class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
         }
         livePhotoMovieURL = outputFileURL
     }
-    
+
     func photoOutput(_ output: AVCapturePhotoOutput, didFinishCapturingDeferredPhotoProxy deferredPhotoProxy: AVCaptureDeferredPhotoProxy?, error: Error?) {
         if let error = error {
             logger.debug("Error capturing deferred photo: \(error)")

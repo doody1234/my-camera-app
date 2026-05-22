@@ -1,5 +1,5 @@
 /*
-See the LICENSE.txt file for this sample’s licensing information.
+See the LICENSE.txt file for this sample's licensing information.
 
 Abstract:
 An object that retrieves camera and microphone devices.
@@ -20,9 +20,10 @@ final class DeviceLookup {
         backCameraDiscoverySession = AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInDualCamera, .builtInWideAngleCamera],
                                                                       mediaType: .video,
                                                                       position: .back)
-        frontCameraDiscoverySession = AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInTrueDepthCamera, .builtInWideAngleCamera],
-                                                                       mediaType: .video,
-                                                                       position: .front)
+        frontCameraDiscoverySession = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInTrueDepthCamera, .builtInWideAngleCamera, .builtInUltraWideCamera],
+            mediaType: .video,
+            position: .front)
         externalCameraDiscoverSession = AVCaptureDevice.DiscoverySession(deviceTypes: [.external],
                                                                          mediaType: .video,
                                                                          position: .unspecified)
@@ -53,6 +54,17 @@ final class DeviceLookup {
         }
     }
     
+    func allCameras(for position: AVCaptureDevice.Position) -> [AVCaptureDevice] {
+        switch position {
+        case .back:
+            return backCameraDiscoverySession.devices
+        case .front:
+            return frontCameraDiscoverySession.devices
+        default:
+            return []
+        }
+    }
+
     var cameras: [AVCaptureDevice] {
         // Populate the cameras array with the available cameras.
         var cameras: [AVCaptureDevice] = []

@@ -1,5 +1,5 @@
 /*
-See the LICENSE.txt file for this sample’s licensing information.
+See the LICENSE.txt file for this sample's licensing information.
 
 Abstract:
 A Camera implementation to use when working with SwiftUI previews.
@@ -7,6 +7,7 @@ A Camera implementation to use when working with SwiftUI previews.
 
 import Foundation
 import SwiftUI
+import AVFoundation
 
 @Observable
 class PreviewCameraModel: Camera {
@@ -15,8 +16,20 @@ class PreviewCameraModel: Camera {
     var prefersMinimizedUI = false
     var qualityPrioritization = QualityPrioritization.quality
     var shouldFlashScreen = false
+    var isReadyToCapture = true
     var isHDRVideoSupported = false
     var isHDRVideoEnabled = false
+
+    var isDeferredProcessingEnabled = true
+    var isFastCapturePrioritizationEnabled = true
+    var isResponsiveCaptureEnabled = true
+
+    var supportedPhotoDimensions: [CMVideoDimensions] = [
+        CMVideoDimensions(width: 1920, height: 1080),
+        CMVideoDimensions(width: 3264, height: 2448),
+        CMVideoDimensions(width: 4032, height: 3024)
+    ]
+    var maxPhotoDimensions = CMVideoDimensions(width: 4032, height: 3024)
     
     struct PreviewSourceStub: PreviewSource {
         // Stubbed out for test purposes.
@@ -61,6 +74,10 @@ class PreviewCameraModel: Camera {
     
     func capturePhoto() {
         logger.debug("Photo capture isn't implemented in PreviewCamera.")
+    }
+
+    func selectMaxPhotoDimensions(_ dimensions: CMVideoDimensions) async {
+        maxPhotoDimensions = dimensions
     }
     
     func toggleRecording() {

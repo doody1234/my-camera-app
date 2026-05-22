@@ -1,5 +1,5 @@
 /*
-See the LICENSE.txt file for this sample’s licensing information.
+See the LICENSE.txt file for this sample's licensing information.
 
 Abstract:
 A view that displays an appropriate capture button for the selected capture mode.
@@ -33,10 +33,14 @@ struct CaptureButton<CameraModel: Camera>: View {
     var captureButton: some View {
         switch camera.captureMode {
         case .photo:
-            PhotoCaptureButton {
-                Task {
-                    await camera.capturePhoto()
+            if camera.isReadyToCapture {
+                PhotoCaptureButton {
+                    Task {
+                        await camera.capturePhoto()
+                    }
                 }
+            } else {
+                BusyShutterButton()
             }
         case .video:
             MovieCaptureButton(isRecording: $isRecording) { _ in
@@ -48,6 +52,7 @@ struct CaptureButton<CameraModel: Camera>: View {
     }
 }
 
+#if targetEnvironment(simulator)
 #Preview("Photo") {
     CaptureButton(camera: PreviewCameraModel(captureMode: .photo))
 }
@@ -55,6 +60,7 @@ struct CaptureButton<CameraModel: Camera>: View {
 #Preview("Video") {
     CaptureButton(camera: PreviewCameraModel(captureMode: .video))
 }
+#endif
 
 private struct PhotoCaptureButton: View {
     private let action: () -> Void
@@ -126,6 +132,32 @@ private struct MovieCaptureButton: View {
     struct NoFadeButtonStyle: ButtonStyle {
         func makeBody(configuration: Configuration) -> some View {
             configuration.label
+        }
+    }
+}
+
+private struct BusyShutterButton: View {
+    private let lineWidth = CGFloat(4.0)
+    @State private var rotation = 0.0
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(lineWidth: lineWidth)
+                .fill(.white.opacity(0.3))
+            Circle()
+                .trim(from: 0, to: 0.3)
+                .stroke(style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                .fill(.white)
+                .rotationEffect(.degrees(rotation))
+            Circle()
+                .inset(by: lineWidth * 1.2)
+                .fill(.white.opacity(0.3))
+        }
+        .onAppear {
+            withAnimation(.linear(duration: 0.8).repeatForever(autoreverses: false)) {
+                rotation = 360
+            }
         }
     }
 }

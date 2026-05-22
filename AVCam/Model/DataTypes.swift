@@ -1,5 +1,5 @@
 /*
-See the LICENSE.txt file for this sample’s licensing information.
+See the LICENSE.txt file for this sample's licensing information.
 
 Abstract:
 Supporting data types for the app.
@@ -55,7 +55,7 @@ enum CaptureActivity {
     }
     
     var isRecording: Bool {
-        if case .movieCapture(_) = self {
+        if case .movieCapture = self {
             return true
         }
         return false
@@ -96,6 +96,7 @@ struct Movie: Sendable {
 struct PhotoFeatures {
     let isLivePhotoEnabled: Bool
     let qualityPrioritization: QualityPrioritization
+    let maxPhotoDimensions: CMVideoDimensions
 }
 
 /// A structure that represents the capture capabilities of `CaptureService` in
@@ -104,13 +105,16 @@ struct CaptureCapabilities {
 
     let isLivePhotoCaptureSupported: Bool
     let isHDRSupported: Bool
-    
+    let supportedPhotoDimensions: [CMVideoDimensions]
+
     init(isLivePhotoCaptureSupported: Bool = false,
-         isHDRSupported: Bool = false) {
+         isHDRSupported: Bool = false,
+         supportedPhotoDimensions: [CMVideoDimensions] = []) {
         self.isLivePhotoCaptureSupported = isLivePhotoCaptureSupported
         self.isHDRSupported = isHDRSupported
+        self.supportedPhotoDimensions = supportedPhotoDimensions
     }
-    
+
     static let unknown = CaptureCapabilities()
 }
 

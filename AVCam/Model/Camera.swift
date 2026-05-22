@@ -1,11 +1,12 @@
 /*
-See the LICENSE.txt file for this sample’s licensing information.
+See the LICENSE.txt file for this sample's licensing information.
 
 Abstract:
 A protocol that represents the model for the camera view.
 */
 
 import SwiftUI
+import AVFoundation
 
 /// A protocol that represents the model for the camera view.
 ///
@@ -49,12 +50,33 @@ protocol Camera: AnyObject, SendableMetatype {
     
     /// A value that indicates how to balance the photo capture quality versus speed.
     var qualityPrioritization: QualityPrioritization { get set }
+
+    /// The available photo dimensions for the current device configuration.
+    var supportedPhotoDimensions: [CMVideoDimensions] { get }
+
+    /// The user-selected maximum photo dimensions.
+    var maxPhotoDimensions: CMVideoDimensions { get set }
+
+    /// Selects the maximum photo dimensions, switching cameras if needed.
+    func selectMaxPhotoDimensions(_ dimensions: CMVideoDimensions) async
     
     /// Captures a photo and writes it to the user's photo library.
     func capturePhoto() async
-    
+
+    /// A Boolean value that indicates whether deferred photo processing is enabled.
+    var isDeferredProcessingEnabled: Bool { get set }
+
+    /// A Boolean value that indicates whether fast capture prioritization is enabled.
+    var isFastCapturePrioritizationEnabled: Bool { get set }
+
+    /// A Boolean value that indicates whether responsive shutter is enabled.
+    var isResponsiveCaptureEnabled: Bool { get set }
+
     /// A Boolean value that indicates whether to show visual feedback when capture begins.
     var shouldFlashScreen: Bool { get }
+
+    /// A Boolean value that indicates whether the camera is ready to capture a new photo.
+    var isReadyToCapture: Bool { get }
     
     /// A Boolean that indicates whether the camera supports HDR video recording.
     var isHDRVideoSupported: Bool { get }
