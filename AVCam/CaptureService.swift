@@ -38,6 +38,10 @@ actor CaptureService {
     // An object that manages the app's video capture behavior.
     private let movieCapture = MovieCapture()
     
+    // Add these lines so the app knows about your new system:
+    private let videoProcessor = VideoProcessor()
+    private var rawFrameCaptureManager: RawFrameCaptureManager?
+    
     // An internal collection of output services.
     private var outputServices: [any OutputService] { [photoCapture, movieCapture] }
     
@@ -277,6 +281,16 @@ actor CaptureService {
         case .video:
             captureSession.sessionPreset = .high
             try addOutput(movieCapture.output)
+            
+            // Integrate your custom pipeline here
+            if rawFrameCaptureManager == nil {
+                rawFrameCaptureManager = RawFrameCaptureManager(
+                    session: captureSession, 
+                    videoProcessor: videoProcessor, 
+                    targetFrameRate: 30
+                )
+            }
+            
             if isHDRVideoEnabled {
                 setHDRVideoEnabled(true)
             }
@@ -541,12 +555,41 @@ actor CaptureService {
     /// Starts recording video. The video records until the user stops recording,
     /// which calls the following `stopRecording()` method.
     func startRecording() {
-        movieCapture.startRecording()
+        if captureMode == .video {
+            // Setup the file path for your custom video
+            let paths = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
+            let fileURL = paths[0].appendingPathComponent("output.mov")
+            
+            // Start the VideoProcessor pipeline
+            try? videoProcessor.beginRecording(to: fileURL, width: 1920, height: 1080)
+            
+            // Start the Raw Frame Capture loop
+            rawFrameCaptureManager?.startCapturing()
+        } else {
+            movieCapture.startRecording()
+        }
     }
     
     /// Stops the recording and returns the captured movie.
     func stopRecording() async throws -> Movie {
-        try await movieCapture.stopRecording()
+        if captureMode == .video {
+            // Stop the capture loop
+            rawFrameCaptureManager?.stopCapturing()
+            
+            // Define where the file is
+            let paths = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
+            let fileURL = paths[0].appendingPathComponent("output.mov")
+            
+            // Tell the VideoProcessor to finish writing
+            return try await withCheckedThrowingContinuation { continuation in
+                videoProcessor.endRecording { url in
+                    // Return a Movie object (assuming your Movie struct takes a URL)
+                    continuation.resume(returning: Movie(url: url!)) 
+                }
+            }
+        } else {
+            return try await movieCapture.stopRecording()
+        }
     }
     
     /// Sets whether the app captures HDR video.
