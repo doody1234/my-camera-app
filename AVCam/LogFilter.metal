@@ -93,3 +93,30 @@ fragment FragmentOut logFilterFragment(VertexOut in [[stage_in]],
     out.cbcr = chromaOut;
     return out;
 }
+
+// =============================================================================
+// RGB-domain variant
+// For frames that arrive already debayered (e.g. from a RAW-photo-capture +
+// demosaic pipeline) rather than as HLG YCbCr. Shares the vertex stage and
+// the applyLogCurve() math above — this is the mathematically correct place
+// for a log OETF to happen, since the input here is approximately linear
+// scene-referred data, not an already-HLG-encoded signal like the path
+// above. Same caveat as before applies to the curve constants: hand-tuned,
+// not a byte-for-byte reproduction of a specific vendor's published curve.
+// No highlight roll-off here — values above 1.0 hard-clip inside
+// logStyleCurve's clamp(). Fine as a starting point; a soft knee is the
+// obvious next improvement if you're seeing clipped highlights.
+// =============================================================================
+
+fragment half4 logFilterRGBFragment(VertexOut in [[stage_in]],
+                                     texture2d<float, access::sample> rgbTexture [[texture(0)]],
+                                     constant float &profileType [[buffer(0)]]) {
+    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
+    float4 linearColor = rgbTexture.sample(s, in.texCoord);
+
+    float r = applyLogCurve(linearColor.r, profileType);
+    float g = applyLogCurve(linearColor.g, profileType);
+    float b = applyLogCurve(linearColor.b, profileType);
+
+    return half4(half3(r, g, b), half(linearColor.a));
+}

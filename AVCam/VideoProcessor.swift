@@ -19,7 +19,7 @@ enum LogProfile: CaseIterable {
 
     /// Value handed to LogFilter.metal's `profileType` uniform.
     /// Unused for .rawHLG since that path never touches Metal.
-    fileprivate var metalProfileValue: Float {
+    var metalProfileValue: Float {
         switch self {
         case .rawHLG: return -1
         case .sLog: return 0.0
@@ -57,7 +57,8 @@ final class VideoProcessor: NSObject {
 
     /// Configures a 10-bit HEVC (Main10 profile) AVAssetWriter matching the
     /// active capture format's dimensions.
-    func beginRecording(to url: URL, width: Int, height: Int) throws {
+    func beginRecording(to url: URL, width: Int, height: Int,
+                        pixelFormat: OSType = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) throws {
         try writerQueue.sync {
             let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
 
@@ -98,7 +99,7 @@ final class VideoProcessor: NSObject {
             vInput.transform = CGAffineTransform(rotationAngle: .pi / 2)
 
             let adaptorAttrs: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height,
                 kCVPixelBufferMetalCompatibilityKey as String: true
@@ -204,6 +205,33 @@ final class VideoProcessor: NSObject {
         writerQueue.async { [weak self] in
             guard let self, self.sessionStarted, let input = self.audioInput, input.isReadyForMoreMediaData else { return }
             input.append(sampleBuffer)
+        }
+    }
+
+    /// For capture paths that never produce a CMSampleBuffer at all — namely
+    /// RawFrameCaptureManager's photo-capture loop. Takes an already-graded
+    /// pixel buffer plus a self-generated timestamp and appends it directly,
+    /// bootstrapping the writer session on the first frame same as process(_:)
+    /// does for the camera-driven path.
+    func appendGradedFrame(_ pixelBuffer: CVPixelBuffer, at time: CMTime) {
+        guard isRecording else { return }
+        writerQueue.async { [weak self] in
+            guard let self, let writer = self.assetWriter, writer.status == .writing else { return }
+
+            if !self.sessionStarted {
+                writer.startSession(atSourceTime: time)
+                self.sessionStarted = true
+            }
+
+            guard
+                let adaptor = self.pixelBufferAdaptor,
+                let input = self.videoInput,
+                input.isReadyForMoreMediaData
+            else { return }
+
+            if !adaptor.append(pixelBuffer, withPresentationTime: time) {
+                print("VideoProcessor: external frame append failed: \(String(describing: writer.error))")
+            }
         }
     }
 }
