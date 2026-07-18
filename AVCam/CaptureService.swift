@@ -583,9 +583,14 @@ actor CaptureService {
             // Tell the VideoProcessor to finish writing
             return try await withCheckedThrowingContinuation { continuation in
                 videoProcessor.endRecording { url in
-                    // Return a Movie object (assuming your Movie struct takes a URL)
-                    continuation.resume(returning: Movie(url: url!)) 
-                }
+    if let url = url {
+        // Safe: we checked that the URL exists
+        continuation.resume(returning: Movie(url: url)) 
+    } else {
+        // Safe: if it failed, we throw an error instead of crashing
+        continuation.resume(throwing: CameraError.setupFailed)
+    }
+}
             }
         } else {
             return try await movieCapture.stopRecording()
