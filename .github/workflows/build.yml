@@ -1,0 +1,14 @@
+name: Build iOS App
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build App
+        run: |
+          xcodebuild clean build -scheme AVCam -destination 'generic/platform=iOS'
