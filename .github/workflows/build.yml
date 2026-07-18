@@ -1,0 +1,17 @@
+name: Build iOS App
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build App
+        run: |
+          xcodebuild clean build -scheme AVCam -destination 'generic/platform=iOS' \
+          CODE_SIGN_IDENTITY="" \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGNING_ALLOWED=NO
