@@ -573,24 +573,21 @@ actor CaptureService {
     /// Stops the recording and returns the captured movie.
     func stopRecording() async throws -> Movie {
         if captureMode == .video {
-            // Stop the capture loop
             rawFrameCaptureManager?.stopCapturing()
             
-            // Define where the file is
             let paths = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
             let fileURL = paths[0].appendingPathComponent("output.mov")
             
-            // Tell the VideoProcessor to finish writing
             return try await withCheckedThrowingContinuation { continuation in
                 videoProcessor.endRecording { url in
-    if let url = url {
-        // Safe: we checked that the URL exists
-        continuation.resume(returning: Movie(url: url)) 
-    } else {
-        // Safe: if it failed, we throw an error instead of crashing
-        continuation.resume(throwing: CameraError.setupFailed)
-    }
-}
+                    // Safe check: if url exists, return it; otherwise throw an error
+                    if let url = url {
+                        continuation.resume(returning: Movie(url: url))
+                    } else {
+                        // Throwing an error here prevents a crash
+                        continuation.resume(throwing: CameraError.setupFailed)
+                    }
+                }
             }
         } else {
             return try await movieCapture.stopRecording()
