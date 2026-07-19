@@ -26,12 +26,9 @@ final class MetalLogRenderer {
         guard let queue = device.makeCommandQueue() else { return nil }
         self.commandQueue = queue
 
-        // These function names must match LogFilter.metal exactly, and that
-        // file must be included in the app target's Compile Sources — a
-        // common CI gotcha: physically having the file in the folder isn't
-        // the same as it being a target member.
+        // Load the shader library from the string in Shaders.swift instead of a file
         guard
-            let library = device.makeDefaultLibrary(),
+            let library = try? device.makeLibrary(source: Shaders.source, options: nil),
             let vertexFn = library.makeFunction(name: "logFilterVertex"),
             let fragmentFn = library.makeFunction(name: "logFilterFragment")
         else { return nil }
@@ -65,13 +62,8 @@ final class MetalLogRenderer {
         self.textureCache = cache
     }
 
-    /// Renders `pixelBuffer` through LogFilter.metal and returns a freshly
+    /// Renders `pixelBuffer` through the log filter and returns a freshly
     /// allocated output buffer in the same 10-bit biplanar format.
-    ///
-    /// Blocks the calling thread until the GPU finishes — fine at 4K30 on
-    /// the A14, but worth revisiting (async completion + a small in-flight
-    /// buffer pool) if you push resolution/frame rate higher and start
-    /// seeing dropped frames under sustained load.
     func render(pixelBuffer: CVPixelBuffer, profileType: Float) -> CVPixelBuffer? {
         guard let outputBuffer = makeOutputBuffer(matching: pixelBuffer) else { return nil }
 
@@ -140,10 +132,6 @@ final class MetalLogRenderer {
 
     // MARK: - RGB path (debayered RAW frames)
 
-    /// Same idea as render(pixelBuffer:profileType:) but for a single-plane
-    /// RGBA input (e.g. a demosaiced RAW frame rendered via CIContext)
-    /// instead of biplanar YCbCr. Returns a new 64-bit half-float RGBA
-    /// buffer with the log curve applied per-channel.
     func renderRGB(pixelBuffer: CVPixelBuffer, profileType: Float) -> CVPixelBuffer? {
         guard let rgbPipelineState else { return nil }
         guard
@@ -187,10 +175,6 @@ final class MetalLogRenderer {
         return CVMetalTextureGetTexture(cvTexture)
     }
 
-    /// Deliberately a plain CVPixelBufferCreate rather than a pool — the
-    /// achievable frame rate from the RAW capture loop is well under video
-    /// rate anyway (see RawFrameCaptureManager), so per-frame allocation
-    /// overhead isn't the bottleneck here. Worth revisiting if it becomes one.
     private func makeRGBOutputBuffer(matching pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
         var outBuffer: CVPixelBuffer?
         let attrs: [String: Any] = [
