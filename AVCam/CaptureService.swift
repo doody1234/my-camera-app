@@ -8,6 +8,16 @@ An object that manages a capture session and its inputs and outputs.
 import Foundation
 @preconcurrency import AVFoundation
 import Combine
+import Metal
+import CoreVideo
+import AVFoundation
+import CoreMedia
+import CoreVideo
+import VideoToolbox
+import AVFoundation
+import CoreImage
+import CoreVideo
+import Metal
 
 /// An actor that manages the capture pipeline, which includes the capture session, device inputs, and capture outputs.
 /// The app defines it as an `actor` type to ensure that all camera operations happen off of the `@MainActor`.
@@ -839,8 +849,6 @@ fragment half4 logFilterRGBFragment(VertexOut in [[stage_in]],
 
     return half4(half3(r, g, b), half(linearColor.a));
 }
-import Metal
-import CoreVideo
 
 /// Pure Metal + CoreVideo module: takes a 10-bit biplanar (x420) CVPixelBuffer
 /// and returns a new one with LogFilter.metal's tone curve applied. Has no
@@ -1044,10 +1052,7 @@ final class MetalLogRenderer {
         return outBuffer
     }
 }
-import AVFoundation
-import CoreImage
-import CoreVideo
-import Metal
+
 
 /// Replicates Log Cam's core trick: there is no public API for streaming raw
 /// Bayer sensor data through AVCaptureVideoDataOutput on any iPhone — that
@@ -1204,10 +1209,7 @@ extension RawFrameCaptureManager: AVCapturePhotoCaptureDelegate {
         return buffer
     }
 }
-import AVFoundation
-import CoreMedia
-import CoreVideo
-import VideoToolbox
+
 
 /// Which "look" a frame should be encoded with.
 enum LogProfile: CaseIterable {
