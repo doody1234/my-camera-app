@@ -717,3 +717,727 @@ class CaptureControlsDelegate: NSObject, AVCaptureSessionControlsDelegate {
         logger.debug("Capture controls inactive.")
     }
 }
+#include <metal_stdlib>
+using namespace metal;
+
+// =============================================================================
+// Vertex stage
+// Fullscreen triangle generated procedurally from vertex_id — no vertex
+// buffer needed. Standard trick for post-process / image passes.
+// =============================================================================
+
+struct VertexOut {
+    float4 position [[position]];
+    float2 texCoord;
+};
+
+vertex VertexOut logFilterVertex(uint vertexID [[vertex_id]]) {
+    const float2 positions[3] = { float2(-1, -1), float2( 3, -1), float2(-1,  3) };
+    const float2 texCoords[3] = { float2( 0,  1), float2( 2,  1), float2( 0, -1) };
+
+    VertexOut out;
+    out.position = float4(positions[vertexID], 0.0, 1.0);
+    out.texCoord = texCoords[vertexID];
+    return out;
+}
+
+// =============================================================================
+// Fragment stage
+// Reads the Y (luma) and CbCr (chroma) planes of a 10-bit biplanar HLG
+// buffer as two textures and writes both planes back out via multiple
+// render targets (MRT), so a single pass produces a complete graded frame.
+// =============================================================================
+
+struct FragmentOut {
+    float  y    [[color(0)]]; // luma plane
+    float2 cbcr [[color(1)]]; // chroma plane
+};
+
+// Rec.2020/HLG "video range" legal range constants for 10-bit signals
+// (luma nominal range 64-940 out of 1023).
+constant float kLumaMin = 64.0  / 1023.0;
+constant float kLumaMax = 940.0 / 1023.0;
+
+inline float logStyleCurve(float x, float blackLift, float whiteCeiling, float g) {
+    float p = pow(clamp(x, 0.0, 1.0), g);
+    return blackLift + p * (whiteCeiling - blackLift);
+}
+
+/// Reshapes normalized (0-1, full range) luma with a curve that mimics the
+/// general SHAPE of a flat log profile: lifted blacks, compressed highlights,
+/// boosted mid-tones. These constants are hand-tuned to taste — this is NOT
+/// a reverse-engineered reproduction of Sony S-Log or Canon C-Log's actual
+/// (proprietary, sensor-specific) transfer functions. Treat it as a starting
+/// point to dial in by eye against real footage.
+inline float applyLogCurve(float x, float profileType) {
+    float blackLift, whiteCeiling, g;
+    if (profileType < 0.5) {
+        // "sLog"-inspired: deeper lift, flatter mid-tones
+        blackLift = 0.06; whiteCeiling = 0.90; g = 0.55;
+    } else {
+        // "cLog"-inspired: slightly punchier
+        blackLift = 0.08; whiteCeiling = 0.88; g = 0.62;
+    }
+    return logStyleCurve(x, blackLift, whiteCeiling, g);
+}
+
+fragment FragmentOut logFilterFragment(VertexOut in [[stage_in]],
+                                        texture2d<float, access::sample> yTexture [[texture(0)]],
+                                        texture2d<float, access::sample> cbcrTexture [[texture(1)]],
+                                        constant float &profileType [[buffer(0)]]) {
+    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
+
+    float  yVideo    = yTexture.sample(s, in.texCoord).r;
+    float2 cbcrVideo = cbcrTexture.sample(s, in.texCoord).rg;
+
+    // Legal (video) range -> full 0-1 range for the curve math.
+    float yFull = clamp((yVideo - kLumaMin) / (kLumaMax - kLumaMin), 0.0, 1.0);
+
+    // This is where the actual "Log math" happens — reshaping the
+    // HLG-encoded luma directly rather than linearizing first. That's
+    // enough to mimic the look cheaply in real time. If you need
+    // colorimetric accuracy instead of a look, invert the HLG OETF to
+    // scene-linear before this step and re-apply an OETF afterwards.
+    float yGraded = applyLogCurve(yFull, profileType);
+
+    // Back to legal range for the HEVC encoder.
+    float yOut = yGraded * (kLumaMax - kLumaMin) + kLumaMin;
+
+    // Mild desaturation so chroma doesn't look artificially punchy sitting
+    // under flattened luma — log footage reads as low-contrast AND low-sat.
+    float2 chromaOut = (cbcrVideo - 0.5) * 0.85 + 0.5;
+
+    FragmentOut out;
+    out.y = yOut;
+    out.cbcr = chromaOut;
+    return out;
+}
+
+// =============================================================================
+// RGB-domain variant
+// For frames that arrive already debayered (e.g. from a RAW-photo-capture +
+// demosaic pipeline) rather than as HLG YCbCr. Shares the vertex stage and
+// the applyLogCurve() math above — this is the mathematically correct place
+// for a log OETF to happen, since the input here is approximately linear
+// scene-referred data, not an already-HLG-encoded signal like the path
+// above. Same caveat as before applies to the curve constants: hand-tuned,
+// not a byte-for-byte reproduction of a specific vendor's published curve.
+// No highlight roll-off here — values above 1.0 hard-clip inside
+// logStyleCurve's clamp(). Fine as a starting point; a soft knee is the
+// obvious next improvement if you're seeing clipped highlights.
+// =============================================================================
+
+fragment half4 logFilterRGBFragment(VertexOut in [[stage_in]],
+                                     texture2d<float, access::sample> rgbTexture [[texture(0)]],
+                                     constant float &profileType [[buffer(0)]]) {
+    constexpr sampler s(coord::normalized, address::clamp_to_edge, filter::linear);
+    float4 linearColor = rgbTexture.sample(s, in.texCoord);
+
+    float r = applyLogCurve(linearColor.r, profileType);
+    float g = applyLogCurve(linearColor.g, profileType);
+    float b = applyLogCurve(linearColor.b, profileType);
+
+    return half4(half3(r, g, b), half(linearColor.a));
+}
+import Metal
+import CoreVideo
+
+/// Pure Metal + CoreVideo module: takes a 10-bit biplanar (x420) CVPixelBuffer
+/// and returns a new one with LogFilter.metal's tone curve applied. Has no
+/// knowledge of AVAssetWriter — VideoProcessor is the only thing that wires
+/// this into the recording pipeline, so this class could just as easily
+/// power a live graded preview instead.
+final class MetalLogRenderer {
+
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let pipelineState: MTLRenderPipelineState
+    /// Second pipeline for debayered RAW frames (single RGBA texture in/out)
+    /// rather than the biplanar YCbCr the HLG path uses. Optional: if
+    /// logFilterRGBFragment isn't found for some reason, the biplanar path
+    /// still works — only renderRGB() is disabled.
+    private let rgbPipelineState: MTLRenderPipelineState?
+    private var textureCache: CVMetalTextureCache!
+    private var pixelBufferPool: CVPixelBufferPool?
+
+    init?(device: MTLDevice? = MTLCreateSystemDefaultDevice()) {
+        guard let device else { return nil }
+        self.device = device
+
+        guard let queue = device.makeCommandQueue() else { return nil }
+        self.commandQueue = queue
+
+        // These function names must match LogFilter.metal exactly, and that
+        // file must be included in the app target's Compile Sources — a
+        // common CI gotcha: physically having the file in the folder isn't
+        // the same as it being a target member.
+        guard
+            let library = device.makeDefaultLibrary(),
+            let vertexFn = library.makeFunction(name: "logFilterVertex"),
+            let fragmentFn = library.makeFunction(name: "logFilterFragment")
+        else { return nil }
+
+        let pipelineDescriptor = MTLRenderPipelineDescriptor()
+        pipelineDescriptor.vertexFunction = vertexFn
+        pipelineDescriptor.fragmentFunction = fragmentFn
+        pipelineDescriptor.colorAttachments[0].pixelFormat = .r16Unorm   // Y plane out
+        pipelineDescriptor.colorAttachments[1].pixelFormat = .rg16Unorm  // CbCr plane out
+
+        do {
+            self.pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+        } catch {
+            print("MetalLogRenderer: failed to build pipeline state: \(error)")
+            return nil
+        }
+
+        if let rgbFragmentFn = library.makeFunction(name: "logFilterRGBFragment") {
+            let rgbDescriptor = MTLRenderPipelineDescriptor()
+            rgbDescriptor.vertexFunction = vertexFn
+            rgbDescriptor.fragmentFunction = rgbFragmentFn
+            rgbDescriptor.colorAttachments[0].pixelFormat = .rgba16Float
+            self.rgbPipelineState = try? device.makeRenderPipelineState(descriptor: rgbDescriptor)
+        } else {
+            self.rgbPipelineState = nil
+        }
+
+        var cache: CVMetalTextureCache?
+        CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache)
+        guard let cache else { return nil }
+        self.textureCache = cache
+    }
+
+    /// Renders `pixelBuffer` through LogFilter.metal and returns a freshly
+    /// allocated output buffer in the same 10-bit biplanar format.
+    ///
+    /// Blocks the calling thread until the GPU finishes — fine at 4K30 on
+    /// the A14, but worth revisiting (async completion + a small in-flight
+    /// buffer pool) if you push resolution/frame rate higher and start
+    /// seeing dropped frames under sustained load.
+    func render(pixelBuffer: CVPixelBuffer, profileType: Float) -> CVPixelBuffer? {
+        guard let outputBuffer = makeOutputBuffer(matching: pixelBuffer) else { return nil }
+
+        guard
+            let yIn = makeTexture(from: pixelBuffer, plane: 0, pixelFormat: .r16Unorm),
+            let cbcrIn = makeTexture(from: pixelBuffer, plane: 1, pixelFormat: .rg16Unorm),
+            let yOut = makeTexture(from: outputBuffer, plane: 0, pixelFormat: .r16Unorm),
+            let cbcrOut = makeTexture(from: outputBuffer, plane: 1, pixelFormat: .rg16Unorm)
+        else { return nil }
+
+        let passDescriptor = MTLRenderPassDescriptor()
+        passDescriptor.colorAttachments[0].texture = yOut
+        passDescriptor.colorAttachments[0].loadAction = .dontCare
+        passDescriptor.colorAttachments[0].storeAction = .store
+        passDescriptor.colorAttachments[1].texture = cbcrOut
+        passDescriptor.colorAttachments[1].loadAction = .dontCare
+        passDescriptor.colorAttachments[1].storeAction = .store
+
+        guard
+            let commandBuffer = commandQueue.makeCommandBuffer(),
+            let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor)
+        else { return nil }
+
+        encoder.setRenderPipelineState(pipelineState)
+        encoder.setFragmentTexture(yIn, index: 0)
+        encoder.setFragmentTexture(cbcrIn, index: 1)
+        var profile = profileType
+        encoder.setFragmentBytes(&profile, length: MemoryLayout<Float>.size, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        encoder.endEncoding()
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        return outputBuffer
+    }
+
+    private func makeTexture(from pixelBuffer: CVPixelBuffer, plane: Int, pixelFormat: MTLPixelFormat) -> MTLTexture? {
+        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, plane)
+        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, plane)
+        var cvTexture: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, textureCache, pixelBuffer, nil,
+            pixelFormat, width, height, plane, &cvTexture
+        )
+        guard status == kCVReturnSuccess, let cvTexture else { return nil }
+        return CVMetalTextureGetTexture(cvTexture)
+    }
+
+    private func makeOutputBuffer(matching pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
+        if pixelBufferPool == nil {
+            let attrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                kCVPixelBufferWidthKey as String: CVPixelBufferGetWidth(pixelBuffer),
+                kCVPixelBufferHeightKey as String: CVPixelBufferGetHeight(pixelBuffer),
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+            ]
+            CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pixelBufferPool)
+        }
+        guard let pool = pixelBufferPool else { return nil }
+        var outBuffer: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &outBuffer)
+        return outBuffer
+    }
+
+    // MARK: - RGB path (debayered RAW frames)
+
+    /// Same idea as render(pixelBuffer:profileType:) but for a single-plane
+    /// RGBA input (e.g. a demosaiced RAW frame rendered via CIContext)
+    /// instead of biplanar YCbCr. Returns a new 64-bit half-float RGBA
+    /// buffer with the log curve applied per-channel.
+    func renderRGB(pixelBuffer: CVPixelBuffer, profileType: Float) -> CVPixelBuffer? {
+        guard let rgbPipelineState else { return nil }
+        guard
+            let outputBuffer = makeRGBOutputBuffer(matching: pixelBuffer),
+            let inTexture = makeRGBTexture(from: pixelBuffer),
+            let outTexture = makeRGBTexture(from: outputBuffer)
+        else { return nil }
+
+        let passDescriptor = MTLRenderPassDescriptor()
+        passDescriptor.colorAttachments[0].texture = outTexture
+        passDescriptor.colorAttachments[0].loadAction = .dontCare
+        passDescriptor.colorAttachments[0].storeAction = .store
+
+        guard
+            let commandBuffer = commandQueue.makeCommandBuffer(),
+            let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: passDescriptor)
+        else { return nil }
+
+        encoder.setRenderPipelineState(rgbPipelineState)
+        encoder.setFragmentTexture(inTexture, index: 0)
+        var profile = profileType
+        encoder.setFragmentBytes(&profile, length: MemoryLayout<Float>.size, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        encoder.endEncoding()
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        return outputBuffer
+    }
+
+    private func makeRGBTexture(from pixelBuffer: CVPixelBuffer) -> MTLTexture? {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        var cvTexture: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault, textureCache, pixelBuffer, nil,
+            .rgba16Float, width, height, 0, &cvTexture
+        )
+        guard status == kCVReturnSuccess, let cvTexture else { return nil }
+        return CVMetalTextureGetTexture(cvTexture)
+    }
+
+    /// Deliberately a plain CVPixelBufferCreate rather than a pool — the
+    /// achievable frame rate from the RAW capture loop is well under video
+    /// rate anyway (see RawFrameCaptureManager), so per-frame allocation
+    /// overhead isn't the bottleneck here. Worth revisiting if it becomes one.
+    private func makeRGBOutputBuffer(matching pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
+        var outBuffer: CVPixelBuffer?
+        let attrs: [String: Any] = [
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ]
+        CVPixelBufferCreate(kCFAllocatorDefault,
+                             CVPixelBufferGetWidth(pixelBuffer), CVPixelBufferGetHeight(pixelBuffer),
+                             kCVPixelFormatType_64RGBAHalf, attrs as CFDictionary, &outBuffer)
+        return outBuffer
+    }
+}
+import AVFoundation
+import CoreImage
+import CoreVideo
+import Metal
+
+/// Replicates Log Cam's core trick: there is no public API for streaming raw
+/// Bayer sensor data through AVCaptureVideoDataOutput on any iPhone — that
+/// wall is real and this doesn't get around it. What CAN be pulled off is
+/// driving AVCapturePhotoOutput's RAW capture (the same pipeline behind DNG
+/// stills) in a tight loop instead of the video pipeline, demosaicing each
+/// frame yourself, and writing the result out as if it were video.
+///
+/// Be clear-eyed about what this is: a repurposed photo API standing in for
+/// a video one. Expect:
+///   - Nowhere near a stable 30fps — each capture has real per-shot overhead
+///     that AVCaptureVideoDataOutput's hardware-clocked delivery doesn't.
+///   - No continuous autofocus while this runs; photo capture doesn't do that.
+///   - Real thermal/pipeline limits on sustained capture — this is exactly
+///     the failure mode behind the dropped-recording reports for apps that
+///     use this technique. Test sustained runs on your actual device before
+///     building anything else on top of this.
+///
+/// I verified the core APIs used here (AVCapturePhoto.pixelBuffer,
+/// CIFilter(cvPixelBuffer:properties:options:), the Bayer pixel format
+/// constant) against real developer references while writing this, but this
+/// corner of AVFoundation is far less traveled than the video path — budget
+/// real device time to work through rough edges I can't catch from here.
+final class RawFrameCaptureManager: NSObject {
+
+    /// Which look to apply. .rawHLG doesn't make sense in this pipeline —
+    /// there's no HLG signal to bypass, everything here goes through the
+    /// RGB grading pass. Default to the flattest look as a sane baseline.
+    var currentProfile: LogProfile = .sLog
+
+    private let photoOutput = AVCapturePhotoOutput()
+    private let rawFormat: OSType
+    private weak var videoProcessor: VideoProcessor?
+
+    private let ciContext: CIContext
+    private let metalRenderer: MetalLogRenderer?
+    private let processingQueue = DispatchQueue(label: "com.mediosnetwork.rawcapture.processing")
+
+    private var isCapturing = false
+    private var frameIndex: Int64 = 0
+    private let targetFrameDuration: CMTime
+
+    init?(session: AVCaptureSession, videoProcessor: VideoProcessor, targetFrameRate: Int32 = 30) {
+        guard session.canAddOutput(photoOutput) else { return nil }
+        session.addOutput(photoOutput)
+
+        // Deliberately plain Bayer RAW, not Apple ProRAW. Multiple developer
+        // reports confirm ProRAW still carries Apple's own boost/tone-mapping
+        // baked in even with every CIRAWFilterOption disabled — plain Bayer
+        // is the closest thing to untouched sensor data a third-party app
+        // can pull on iPhone.
+        guard let rawFormat = photoOutput.availableRawPhotoPixelFormatTypes.first else { return nil }
+        self.rawFormat = rawFormat
+
+        guard let device = MTLCreateSystemDefaultDevice() else { return nil }
+        self.ciContext = CIContext(mtlDevice: device)
+        self.metalRenderer = MetalLogRenderer(device: device)
+
+        self.videoProcessor = videoProcessor
+        self.targetFrameDuration = CMTime(value: 1, timescale: targetFrameRate)
+
+        super.init()
+    }
+
+    // MARK: - Loop control
+
+    func startCapturing() {
+        guard !isCapturing else { return }
+        isCapturing = true
+        frameIndex = 0
+        captureNextFrame()
+    }
+
+    func stopCapturing() {
+        isCapturing = false
+    }
+
+    private func captureNextFrame() {
+        guard isCapturing else { return }
+        // RAW-only request: no processedFormat means no companion JPEG/HEIC,
+        // which keeps per-shot overhead down.
+        let settings = AVCapturePhotoSettings(rawPixelFormatType: rawFormat)
+        settings.photoQualityPrioritization = .speed
+        photoOutput.capturePhoto(with: settings, delegate: self)
+    }
+}
+
+// MARK: - AVCapturePhotoCaptureDelegate
+
+extension RawFrameCaptureManager: AVCapturePhotoCaptureDelegate {
+
+    func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
+        // This is the backpressure: the next capture only fires once this
+        // one is fully off our hands. That serializes the loop and keeps it
+        // from overlapping itself, at the cost of the achievable rate being
+        // well under 30fps — treat that as a property of the technique, not
+        // a bug to chase.
+        defer {
+            processingQueue.async { [weak self] in
+                guard let self, self.isCapturing else { return }
+                self.captureNextFrame()
+            }
+        }
+
+        guard error == nil, let rawPixelBuffer = photo.pixelBuffer else {
+            if let error { print("RawFrameCaptureManager: capture failed: \(error)") }
+            return
+        }
+        let metadata = photo.metadata
+
+        processingQueue.async { [weak self] in
+            self?.handle(rawPixelBuffer: rawPixelBuffer, metadata: metadata)
+        }
+    }
+
+    private func handle(rawPixelBuffer: CVPixelBuffer, metadata: [String: Any]) {
+        // Demosaic with Apple's own RAW pipeline (CIFilter's raw processing
+        // is a well-tested, sanctioned demosaic — reinventing that from
+        // scratch buys little), but with every "look" decision it would
+        // otherwise bake in turned off. Goal is linear-ish scene data, not
+        // Apple's rendering of it.
+        let options: [CIRAWFilterOption: Any] = [
+            .baselineExposure: 0.0,
+            .boostAmount: 0.0,
+            .boostShadowAmount: 0.0,
+            .disableGamutMap: true
+        ]
+        guard
+            let rawFilter = CIFilter(cvPixelBuffer: rawPixelBuffer, properties: metadata, options: options),
+            let demosaiced = rawFilter.outputImage
+        else { return }
+
+        guard let rgbaBuffer = makeRGBABuffer(width: Int(demosaiced.extent.width), height: Int(demosaiced.extent.height)) else { return }
+        ciContext.render(demosaiced, to: rgbaBuffer)
+
+        guard let graded = metalRenderer?.renderRGB(pixelBuffer: rgbaBuffer, profileType: currentProfile.metalProfileValue) else { return }
+
+        // Synthetic timeline: we're not hardware-clocked here, so we build
+        // our own monotonic PTS from a frame counter rather than trying to
+        // read a real capture timestamp off a photo request.
+        let pts = CMTimeMultiply(targetFrameDuration, multiplier: Int32(frameIndex))
+        frameIndex += 1
+
+        videoProcessor?.appendGradedFrame(graded, at: pts)
+    }
+
+    private func makeRGBABuffer(width: Int, height: Int) -> CVPixelBuffer? {
+        var buffer: CVPixelBuffer?
+        let attrs: [String: Any] = [
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ]
+        CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_64RGBAHalf, attrs as CFDictionary, &buffer)
+        return buffer
+    }
+}
+import AVFoundation
+import CoreMedia
+import CoreVideo
+import VideoToolbox
+
+/// Which "look" a frame should be encoded with.
+enum LogProfile: CaseIterable {
+    case rawHLG   // straight passthrough of the 10-bit HLG signal
+    case sLog     // Metal-graded, Sony S-Log-inspired flat curve
+    case cLog     // Metal-graded, Canon C-Log-inspired flat curve
+
+    var displayName: String {
+        switch self {
+        case .rawHLG: return "Raw HLG"
+        case .sLog: return "S-Log Style"
+        case .cLog: return "C-Log Style"
+        }
+    }
+
+    /// Value handed to LogFilter.metal's `profileType` uniform.
+    /// Unused for .rawHLG since that path never touches Metal.
+    var metalProfileValue: Float {
+        switch self {
+        case .rawHLG: return -1
+        case .sLog: return 0.0
+        case .cLog: return 1.0
+        }
+    }
+}
+
+enum VideoProcessorError: Error {
+    case cannotAddInput
+    case cannotStartWriting
+}
+
+/// Consumes CMSampleBuffers from CameraManager and either (a) bypasses them
+/// straight into the AVAssetWriter untouched, or (b) runs them through a
+/// Metal grading pass first, depending on `currentProfile`.
+final class VideoProcessor: NSObject {
+
+    var currentProfile: LogProfile = .rawHLG
+    private(set) var isRecording = false
+
+    private var assetWriter: AVAssetWriter?
+    private var videoInput: AVAssetWriterInput?
+    private var audioInput: AVAssetWriterInput?
+    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    private var sessionStarted = false
+
+    // Serializes all writer state so setup / frame-append / teardown can't
+    // race each other across the different queues that call into this class.
+    private let writerQueue = DispatchQueue(label: "com.mediosnetwork.videoprocessor.writer")
+
+    private let metalRenderer = MetalLogRenderer()
+
+    // MARK: - Setup / teardown
+
+    /// Configures a 10-bit HEVC (Main10 profile) AVAssetWriter matching the
+    /// active capture format's dimensions.
+    func beginRecording(to url: URL, width: Int, height: Int,
+                        pixelFormat: OSType = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) throws {
+        try writerQueue.sync {
+            let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+
+            // Rough heuristic starting point for 10-bit HEVC at ~30fps — tune
+            // to taste, or scale it against the format's actual max frame rate.
+            let bitRate = Int(Double(width * height) * 0.2 * 30)
+
+            let compressionProperties: [String: Any] = [
+                AVVideoAverageBitRateKey: bitRate,
+                AVVideoMaxKeyFrameIntervalKey: 30,
+                AVVideoAllowFrameReorderingKey: true,
+                // This is the key that actually forces Main10 (10-bit) rather
+                // than letting VideoToolbox silently pick an 8-bit profile.
+                kVTCompressionPropertyKey_ProfileLevel as String: kVTProfileLevel_HEVC_Main10_AutoLevel
+            ]
+
+            let colorProperties: [String: Any] = [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020
+            ]
+
+            let videoSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.hevc,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoCompressionPropertiesKey: compressionProperties,
+                AVVideoColorPropertiesKey: colorProperties
+            ]
+
+            let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+            vInput.expectsMediaDataInRealTime = true
+            // The sensor delivers landscape-right buffers (see CameraManager's
+            // note on connection rotation). Rotate on playback via the track's
+            // display transform rather than physically rotating every frame.
+            // Verify on-device — flip the sign to -.pi / 2 if it plays back
+            // upside-down/mirrored for your mount orientation.
+            vInput.transform = CGAffineTransform(rotationAngle: .pi / 2)
+
+            let adaptorAttrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ]
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: vInput, sourcePixelBufferAttributes: adaptorAttrs)
+
+            guard writer.canAdd(vInput) else { throw VideoProcessorError.cannotAddInput }
+            writer.add(vInput)
+
+            let aInput = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVNumberOfChannelsKey: 2,
+                AVSampleRateKey: 44_100.0,
+                AVEncoderBitRateKey: 128_000
+            ])
+            aInput.expectsMediaDataInRealTime = true
+            guard writer.canAdd(aInput) else { throw VideoProcessorError.cannotAddInput }
+            writer.add(aInput)
+
+            guard writer.startWriting() else { throw VideoProcessorError.cannotStartWriting }
+
+            self.assetWriter = writer
+            self.videoInput = vInput
+            self.audioInput = aInput
+            self.pixelBufferAdaptor = adaptor
+            self.sessionStarted = false
+            self.isRecording = true
+        }
+    }
+
+    func endRecording(completion: @escaping (URL?) -> Void) {
+        writerQueue.async { [weak self] in
+            guard let self, let writer = self.assetWriter else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            self.isRecording = false
+            self.videoInput?.markAsFinished()
+            self.audioInput?.markAsFinished()
+            writer.finishWriting {
+                let url = writer.status == .completed ? writer.outputURL : nil
+                if writer.status == .failed {
+                    print("VideoProcessor: writer failed: \(String(describing: writer.error))")
+                }
+                self.reset()
+                DispatchQueue.main.async { completion(url) }
+            }
+        }
+    }
+
+    private func reset() {
+        assetWriter = nil
+        videoInput = nil
+        audioInput = nil
+        pixelBufferAdaptor = nil
+        sessionStarted = false
+    }
+
+    // MARK: - Frame processing
+
+    /// The core branch point: raw HLG bypasses Metal entirely; sLog/cLog run
+    /// through LogFilter.metal first.
+    func process(sampleBuffer: CMSampleBuffer) {
+        guard isRecording, CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+
+        writerQueue.async { [weak self] in
+            guard let self, let writer = self.assetWriter, writer.status == .writing else { return }
+
+            if !self.sessionStarted {
+                writer.startSession(atSourceTime: pts)
+                self.sessionStarted = true
+            }
+
+            switch self.currentProfile {
+            case .rawHLG:
+                // BYPASS: the 10-bit HLG sample buffer goes straight to the
+                // writer untouched — no Metal, no recompression of the data.
+                guard let input = self.videoInput, input.isReadyForMoreMediaData else { return }
+                if !input.append(sampleBuffer) {
+                    print("VideoProcessor: raw append failed: \(String(describing: writer.error))")
+                }
+
+            case .sLog, .cLog:
+                // PIPELINE: reshape the HLG data through Metal first.
+                guard
+                    let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
+                    let renderer = self.metalRenderer,
+                    let graded = renderer.render(pixelBuffer: pixelBuffer, profileType: self.currentProfile.metalProfileValue),
+                    let adaptor = self.pixelBufferAdaptor,
+                    let input = self.videoInput,
+                    input.isReadyForMoreMediaData
+                else { return }
+                if !adaptor.append(graded, withPresentationTime: pts) {
+                    print("VideoProcessor: graded append failed: \(String(describing: writer.error))")
+                }
+            }
+        }
+    }
+
+    func processAudio(sampleBuffer: CMSampleBuffer) {
+        guard isRecording else { return }
+        writerQueue.async { [weak self] in
+            guard let self, self.sessionStarted, let input = self.audioInput, input.isReadyForMoreMediaData else { return }
+            input.append(sampleBuffer)
+        }
+    }
+
+    /// For capture paths that never produce a CMSampleBuffer at all — namely
+    /// RawFrameCaptureManager's photo-capture loop. Takes an already-graded
+    /// pixel buffer plus a self-generated timestamp and appends it directly,
+    /// bootstrapping the writer session on the first frame same as process(_:)
+    /// does for the camera-driven path.
+    func appendGradedFrame(_ pixelBuffer: CVPixelBuffer, at time: CMTime) {
+        guard isRecording else { return }
+        writerQueue.async { [weak self] in
+            guard let self, let writer = self.assetWriter, writer.status == .writing else { return }
+
+            if !self.sessionStarted {
+                writer.startSession(atSourceTime: time)
+                self.sessionStarted = true
+            }
+
+            guard
+                let adaptor = self.pixelBufferAdaptor,
+                let input = self.videoInput,
+                input.isReadyForMoreMediaData
+            else { return }
+
+            if !adaptor.append(pixelBuffer, withPresentationTime: time) {
+                print("VideoProcessor: external frame append failed: \(String(describing: writer.error))")
+            }
+        }
+    }
+}
